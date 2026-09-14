@@ -222,7 +222,7 @@ curl -X POST http://127.0.0.1:3020/rubbings/rubbing_demo/storage-periods \
 
 #### `GET /anomalies?rubbingId=&locationId=&status=`
 查询异常时段。
-- `rubbingId`：**只返回与该拓片保存时段（同位置）有时间交集的异常**。异常起点在时段之前、但延伸进时段内（open）的会返回；整段位于时段之外（例如发生在两段存放之间的空档、或时段结束后）不返回
+- `rubbingId`：**只返回与该拓片保存时段（同位置）有时间交集的异常**。异常起点在时段之前、但延伸进时段内（open）的会返回；整段位于时段之外（例如发生在两段存放之间的空档、或时段结束后）不返回。异常时段与保存时段都按半开区间处理，**端点相接不算交集**——异常 `endAt === 保存时段 startAt`（异常在时段起点整点恰好结束）或异常 `startAt === 保存时段 endAt`（异常在时段终点整点才开始）均不返回，必须真正跨入或发生在时段内
 - `locationId`：不限拓片时返回该位置全部异常；与 rubbingId 组合时语义同读数查询
 - `status`：`open`（进行中）或 `closed`（已关闭）
 - 按 `startAt` 降序，返回项附带 `locationName`

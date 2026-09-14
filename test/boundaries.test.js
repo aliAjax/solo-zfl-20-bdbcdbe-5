@@ -190,9 +190,10 @@ test("按拓片查询异常：仅返回与保存时段有交集的异常（时�
   assert.deepEqual(openForRubbing, []);
 });
 
-test("异常跨保存时段边界：endAt 落在时段内但起点在时段前 → 不算该拓片的异常", async () => {
-  // 单独构造：异常在保存时段开始前开启并持续——若异常 [aStart,aEnd] 与 [pStart,pEnd)
-  // 仅在 pStart 之前存在（aEnd <= pStart），必须排除。
+test("精确端点相切之一：异常 endAt === 保存时段 startAt，按拓片查询不返回", async () => {
+  // 异常 [09-10T10:00, 12:00) 与保存时段 [12:00, 09-12T00:00) 在 12:00 整点相接。
+  // 两者都是半开区间：异常的终点时刻不属于异常，时段的起点时刻属于时段，
+  // 端点相接没有公共时间点，必须排除。
   const rubbing = await h.createRubbing();
   const loc = await h.createLocation({ name: "贴边库" });
   await h.post(`/rubbings/${rubbing.id}/storage-periods`, {
@@ -200,20 +201,88 @@ test("异常跨保存时段边界：endAt 落在时段内但起点在时段前 �
     startAt: "2026-09-10T12:00:00Z",
     endAt: "2026-09-12T00:00:00Z"
   });
-  // 异常 09:00 开、11:00 关（整点贴边：aEnd == pStart）
+  // 正常打底 -> 两次越限(10:00/11:00)开启 -> 11:30 第一次正常 -> 12:00 第二次正常关闭
   for (const [ts, t] of [
-    ["2026-09-10T08:00:00Z", 20],
-    ["2026-09-10T09:00:00Z", 30],
-    ["2026-09-10T10:00:00Z", 31],
-    ["2026-09-10T11:00:00Z", 20],
-    ["2026-09-10T11:30:00Z", 20]
+    ["2026-09-10T09:00:00Z", 20],
+    ["2026-09-10T10:00:00Z", 30],
+    ["2026-09-10T11:00:00Z", 31],
+    ["2026-09-10T11:30:00Z", 20],
+    ["2026-09-10T12:00:00Z", 20]
+  ]) {
+    const r = await h.addReading(loc.id, ts, { temperature: t });
+    assert.equal(r.status, 201, ts);
+  }
+
+  // 位置维度能看到这个异常，其 endAt 恰好是 12:00
+  const byLocation = (await h.get(`/anomalies?locationId=${loc.id}`)).body.data;
+  assert.equal(byLocation.length, 1);
+  assert.equal(byLocation[0].startAt, "2026-09-10T10:00:00.000Z");
+  assert.equal(byLocation[0].endAt, "2026-09-10T12:00:00.000Z");
+
+  // 按拓片查询：异常与保存时段仅端点相接，不返回
+  assert.deepEqual((await h.get(`/anomalies?rubbingId=${rubbing.id}`)).body.data, []);
+  assert.deepEqual((await h.get(`/anomalies?rubbingId=${rubbing.id}&status=closed`)).body.data, []);
+
+  // 12:00 这条正常读数的事件时间落在时段起点（含 startAt），读数维度仍返回
+  const readings = (await h.get(`/readings?rubbingId=${rubbing.id}`)).body.data;
+  assert.deepEqual(readings.map((r) => r.ts), ["2026-09-10T12:00:00.000Z"]);
+  assert.equal(readings[0].breached, false);
+});
+
+test("精确端点相切之二：异常 startAt === 保存时段 endAt，按拓片查询不返回", async () => {
+  // 对称端点：保存时段 [12:00,14:00)，异常从 14:00 整点开启（endAt 不属于时段）。
+  const rubbing = await h.createRubbing();
+  const loc = await h.createLocation({ name: "右贴边库" });
+  await h.post(`/rubbings/${rubbing.id}/storage-periods`, {
+    locationId: loc.id,
+    startAt: "2026-09-10T12:00:00Z",
+    endAt: "2026-09-10T14:00:00Z"
+  });
+  // 13:00 时段内正常；14:00(=时段end) 第一次越限；15:00 第二次越限 -> 异常 startAt=14:00
+  for (const [ts, t] of [
+    ["2026-09-10T13:00:00Z", 20],
+    ["2026-09-10T14:00:00Z", 30],
+    ["2026-09-10T15:00:00Z", 31]
+  ]) {
+    const r = await h.addReading(loc.id, ts, { temperature: t });
+    assert.equal(r.status, 201, ts);
+  }
+
+  const byLocation = (await h.get(`/anomalies?locationId=${loc.id}`)).body.data;
+  assert.equal(byLocation.length, 1);
+  assert.equal(byLocation[0].startAt, "2026-09-10T14:00:00.000Z");
+  assert.equal(byLocation[0].status, "open");
+
+  // startAt 正好等于时段 endAt（半开，不含），不算交集
+  assert.deepEqual((await h.get(`/anomalies?rubbingId=${rubbing.id}`)).body.data, []);
+  assert.deepEqual((await h.get(`/anomalies?rubbingId=${rubbing.id}&status=open`)).body.data, []);
+
+  // 读数维度：14:00/15:00 都在时段外，只返回 13:00
+  const readings = (await h.get(`/readings?rubbingId=${rubbing.id}`)).body.data;
+  assert.deepEqual(readings.map((r) => r.ts), ["2026-09-10T13:00:00.000Z"]);
+});
+
+test("非相切对照：异常跨入保存时段 1 分钟即应返回（防修复过度）", async () => {
+  const rubbing = await h.createRubbing();
+  const loc = await h.createLocation({ name: "跨一分钟库" });
+  await h.post(`/rubbings/${rubbing.id}/storage-periods`, {
+    locationId: loc.id,
+    startAt: "2026-09-10T12:00:00Z",
+    endAt: "2026-09-12T00:00:00Z"
+  });
+  // 异常 [11:00, ...)，12:01 仍在越限（open），跨入时段 1 分钟
+  for (const [ts, t] of [
+    ["2026-09-10T10:00:00Z", 20],
+    ["2026-09-10T11:00:00Z", 30],
+    ["2026-09-10T11:30:00Z", 31],
+    ["2026-09-10T12:01:00Z", 31]
   ]) {
     await h.addReading(loc.id, ts, { temperature: t });
   }
   const forRubbing = (await h.get(`/anomalies?rubbingId=${rubbing.id}`)).body.data;
-  assert.deepEqual(forRubbing, []);
-  const readings = (await h.get(`/readings?rubbingId=${rubbing.id}`)).body.data;
-  assert.deepEqual(readings, []);
+  assert.equal(forRubbing.length, 1);
+  assert.equal(forRubbing[0].startAt, "2026-09-10T11:00:00.000Z");
+  assert.equal(forRubbing[0].status, "open");
 });
 
 test("异常横跨边界（保存时段前开启、时段内仍在继续）应返回", async () => {
