@@ -1,53 +1,11 @@
 const http = require("http");
-const { readFile, writeFile, mkdir } = require("fs/promises");
-const path = require("path");
+const { readDb, mutate, makeId } = require("./lib/db");
+const storage = require("./lib/storage");
 
 const PORT = Number(process.env.PORT || 3020);
-const DB_FILE = path.join(__dirname, "data", "db.json");
-
-const initialData = {
-  rubbings: [
-    {
-      id: "rubbing_demo",
-      code: "TP-清-014",
-      source: "地方碑刻残页",
-      paperSize: "42x68cm",
-      note: "边缘有旧折痕",
-      createdAt: new Date().toISOString()
-    }
-  ],
-  damages: [
-    {
-      id: "damage_demo_1",
-      rubbingId: "rubbing_demo",
-      position: "左上角第3列题字旁",
-      type: "虫蛀孔",
-      beforePhotoUrl: "https://example.local/before-014-1.jpg",
-      afterPhotoUrl: "",
-      status: "pending",
-      repairNote: "",
-      batchId: null,
-      createdAt: new Date().toISOString(),
-      repairedAt: null
-    },
-    {
-      id: "damage_demo_2",
-      rubbingId: "rubbing_demo",
-      position: "下边缘中央",
-      type: "撕裂",
-      beforePhotoUrl: "https://example.local/before-014-2.jpg",
-      afterPhotoUrl: "",
-      status: "pending",
-      repairNote: "",
-      batchId: null,
-      createdAt: new Date().toISOString(),
-      repairedAt: null
-    }
-  ],
-  batches: []
-};
 
 const routes = [
+  // 原有接口（拓片登记 / 缺损项 / 修补批次）
   "GET /health",
   "GET /rubbings",
   "POST /rubbings",
@@ -58,26 +16,19 @@ const routes = [
   "GET /batches",
   "POST /batches",
   "GET /batches/:id",
-  "POST /batches/:id/complete"
+  "POST /batches/:id/complete",
+  // 保存环境巡护
+  "GET /locations",
+  "POST /locations",
+  "GET /locations/:id",
+  "PATCH /locations/:id",
+  "GET /storage-periods?rubbingId=&locationId=&active=",
+  "POST /rubbings/:id/storage-periods",
+  "POST /storage-periods/:id/close",
+  "POST /locations/:id/readings",
+  "GET /readings?rubbingId=&locationId=&breached=&from=&to=&limit=",
+  "GET /anomalies?rubbingId=&locationId=&status="
 ];
-
-async function ensureDb() {
-  await mkdir(path.dirname(DB_FILE), { recursive: true });
-  try {
-    JSON.parse(await readFile(DB_FILE, "utf8"));
-  } catch {
-    await writeFile(DB_FILE, JSON.stringify(initialData, null, 2));
-  }
-}
-
-async function readDb() {
-  await ensureDb();
-  return JSON.parse(await readFile(DB_FILE, "utf8"));
-}
-
-async function writeDb(data) {
-  await writeFile(DB_FILE, JSON.stringify(data, null, 2));
-}
 
 function send(res, status, body) {
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
@@ -95,10 +46,6 @@ async function parseBody(req) {
     error.status = 400;
     throw error;
   }
-}
-
-function makeId(prefix) {
-  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
 function required(body, fields) {
@@ -134,13 +81,16 @@ function enrichBatch(db, batch) {
 async function handle(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const pathname = url.pathname;
-  const db = await readDb();
+  const q = (name) => url.searchParams.get(name);
 
   if (req.method === "GET" && pathname === "/health") {
     return send(res, 200, { ok: true, service: "rubbing-repair-api", routes });
   }
 
+  // ---- 拓片登记（原有接口，行为不变）-------------------------------------
+
   if (req.method === "GET" && pathname === "/rubbings") {
+    const db = await readDb();
     const data = db.rubbings.map((rubbing) => {
       const damages = db.damages.filter((item) => item.rubbingId === rubbing.id);
       return {
@@ -155,106 +105,122 @@ async function handle(req, res) {
   if (req.method === "POST" && pathname === "/rubbings") {
     const body = await parseBody(req);
     required(body, ["code", "source", "paperSize"]);
-    const rubbing = {
-      id: makeId("rubbing"),
-      code: body.code,
-      source: body.source,
-      paperSize: body.paperSize,
-      note: body.note || "",
-      createdAt: new Date().toISOString()
-    };
-    db.rubbings.push(rubbing);
-    await writeDb(db);
+    const rubbing = await mutate((db) => {
+      const item = {
+        id: makeId("rubbing"),
+        code: body.code,
+        source: body.source,
+        paperSize: body.paperSize,
+        note: body.note || "",
+        createdAt: new Date().toISOString()
+      };
+      db.rubbings.push(item);
+      return item;
+    });
     return send(res, 201, { data: rubbing });
   }
 
   const rubbingDamagesMatch = pathname.match(/^\/rubbings\/([^/]+)\/damages$/);
   if (rubbingDamagesMatch && req.method === "GET") {
     const rubbingId = rubbingDamagesMatch[1];
+    const db = await readDb();
     findRubbing(db, rubbingId);
     return send(res, 200, { data: db.damages.filter((item) => item.rubbingId === rubbingId) });
   }
 
   if (rubbingDamagesMatch && req.method === "POST") {
     const rubbingId = rubbingDamagesMatch[1];
-    findRubbing(db, rubbingId);
     const body = await parseBody(req);
     required(body, ["position", "type", "beforePhotoUrl"]);
-    const damage = {
-      id: makeId("damage"),
-      rubbingId,
-      position: body.position,
-      type: body.type,
-      beforePhotoUrl: body.beforePhotoUrl,
-      afterPhotoUrl: "",
-      status: "pending",
-      repairNote: "",
-      batchId: null,
-      createdAt: new Date().toISOString(),
-      repairedAt: null
-    };
-    db.damages.push(damage);
-    await writeDb(db);
+    const damage = await mutate((db) => {
+      findRubbing(db, rubbingId);
+      const item = {
+        id: makeId("damage"),
+        rubbingId,
+        position: body.position,
+        type: body.type,
+        beforePhotoUrl: body.beforePhotoUrl,
+        afterPhotoUrl: "",
+        status: "pending",
+        repairNote: "",
+        batchId: null,
+        createdAt: new Date().toISOString(),
+        repairedAt: null
+      };
+      db.damages.push(item);
+      return item;
+    });
     return send(res, 201, { data: damage });
   }
 
   if (req.method === "GET" && pathname === "/damages") {
-    const status = url.searchParams.get("status");
-    const type = url.searchParams.get("type");
+    const status = q("status");
+    const type = q("type");
+    const db = await readDb();
     const data = db.damages.filter((item) => (!status || item.status === status) && (!type || item.type === type));
     return send(res, 200, { data });
   }
 
   const damagePatchMatch = pathname.match(/^\/damages\/([^/]+)$/);
   if (damagePatchMatch && req.method === "PATCH") {
-    const damage = db.damages.find((item) => item.id === damagePatchMatch[1]);
-    if (!damage) return send(res, 404, { error: "缺损项不存在" });
     const body = await parseBody(req);
-    Object.assign(damage, {
-      position: body.position ?? damage.position,
-      type: body.type ?? damage.type,
-      beforePhotoUrl: body.beforePhotoUrl ?? damage.beforePhotoUrl,
-      afterPhotoUrl: body.afterPhotoUrl ?? damage.afterPhotoUrl,
-      status: body.status ?? damage.status,
-      repairNote: body.repairNote ?? damage.repairNote
+    const result = await mutate((db) => {
+      const damage = db.damages.find((item) => item.id === damagePatchMatch[1]);
+      if (!damage) return { status: 404, error: "缺损项不存在" };
+      Object.assign(damage, {
+        position: body.position ?? damage.position,
+        type: body.type ?? damage.type,
+        beforePhotoUrl: body.beforePhotoUrl ?? damage.beforePhotoUrl,
+        afterPhotoUrl: body.afterPhotoUrl ?? damage.afterPhotoUrl,
+        status: body.status ?? damage.status,
+        repairNote: body.repairNote ?? damage.repairNote
+      });
+      damage.repairedAt = damage.status === "repaired" ? new Date().toISOString() : damage.repairedAt;
+      return { status: 200, data: damage };
     });
-    damage.repairedAt = damage.status === "repaired" ? new Date().toISOString() : damage.repairedAt;
-    await writeDb(db);
-    return send(res, 200, { data: damage });
+    return send(res, result.status, result.error ? result : { data: result.data });
   }
 
+  // ---- 修补批次（原有接口，行为不变）-------------------------------------
+
   if (req.method === "GET" && pathname === "/batches") {
+    const db = await readDb();
     return send(res, 200, { data: db.batches.map((batch) => enrichBatch(db, batch)) });
   }
 
   if (req.method === "POST" && pathname === "/batches") {
     const body = await parseBody(req);
     required(body, ["name", "damageIds"]);
-    if (!Array.isArray(body.damageIds) || body.damageIds.length === 0) return send(res, 400, { error: "damageIds必须是非空数组" });
-    const invalid = body.damageIds.filter((id) => !db.damages.find((damage) => damage.id === id));
-    if (invalid.length) return send(res, 400, { error: `缺损项不存在：${invalid.join(", ")}` });
-    const batch = {
-      id: makeId("batch"),
-      name: body.name,
-      status: "open",
-      damageIds: body.damageIds,
-      note: body.note || "",
-      createdAt: new Date().toISOString(),
-      completedAt: null
-    };
-    db.batches.push(batch);
-    db.damages.forEach((damage) => {
-      if (body.damageIds.includes(damage.id)) {
-        damage.batchId = batch.id;
-        damage.status = "in_repair";
-      }
+    if (!Array.isArray(body.damageIds) || body.damageIds.length === 0) {
+      return send(res, 400, { error: "damageIds必须是非空数组" });
+    }
+    const result = await mutate((db) => {
+      const invalid = body.damageIds.filter((id) => !db.damages.find((damage) => damage.id === id));
+      if (invalid.length) return { status: 400, error: `缺损项不存在：${invalid.join(", ")}` };
+      const batch = {
+        id: makeId("batch"),
+        name: body.name,
+        status: "open",
+        damageIds: body.damageIds,
+        note: body.note || "",
+        createdAt: new Date().toISOString(),
+        completedAt: null
+      };
+      db.batches.push(batch);
+      db.damages.forEach((damage) => {
+        if (body.damageIds.includes(damage.id)) {
+          damage.batchId = batch.id;
+          damage.status = "in_repair";
+        }
+      });
+      return { status: 201, data: enrichBatch(db, batch) };
     });
-    await writeDb(db);
-    return send(res, 201, { data: enrichBatch(db, batch) });
+    return send(res, result.status, result.error ? result : { data: result.data });
   }
 
   const batchMatch = pathname.match(/^\/batches\/([^/]+)$/);
   if (batchMatch && req.method === "GET") {
+    const db = await readDb();
     const batch = db.batches.find((item) => item.id === batchMatch[1]);
     if (!batch) return send(res, 404, { error: "修补批次不存在" });
     return send(res, 200, { data: enrichBatch(db, batch) });
@@ -262,32 +228,151 @@ async function handle(req, res) {
 
   const completeMatch = pathname.match(/^\/batches\/([^/]+)\/complete$/);
   if (completeMatch && req.method === "POST") {
-    const batch = db.batches.find((item) => item.id === completeMatch[1]);
-    if (!batch) return send(res, 404, { error: "修补批次不存在" });
     const body = await parseBody(req);
     const results = Array.isArray(body.results) ? body.results : [];
-    batch.status = "completed";
-    batch.completedAt = new Date().toISOString();
-    batch.note = body.note ?? batch.note;
-    db.damages.forEach((damage) => {
-      if (!batch.damageIds.includes(damage.id)) return;
-      const result = results.find((item) => item.damageId === damage.id) || {};
-      damage.status = "repaired";
-      damage.afterPhotoUrl = result.afterPhotoUrl || body.defaultAfterPhotoUrl || damage.afterPhotoUrl;
-      damage.repairNote = result.repairNote || body.defaultRepairNote || damage.repairNote;
-      damage.repairedAt = new Date().toISOString();
+    const result = await mutate((db) => {
+      const batch = db.batches.find((item) => item.id === completeMatch[1]);
+      if (!batch) return { status: 404, error: "修补批次不存在" };
+      batch.status = "completed";
+      batch.completedAt = new Date().toISOString();
+      batch.note = body.note ?? batch.note;
+      db.damages.forEach((damage) => {
+        if (!batch.damageIds.includes(damage.id)) return;
+        const item = results.find((entry) => entry.damageId === damage.id) || {};
+        damage.status = "repaired";
+        damage.afterPhotoUrl = item.afterPhotoUrl || body.defaultAfterPhotoUrl || damage.afterPhotoUrl;
+        damage.repairNote = item.repairNote || body.defaultRepairNote || damage.repairNote;
+        damage.repairedAt = new Date().toISOString();
+      });
+      return { status: 200, data: enrichBatch(db, batch) };
     });
-    await writeDb(db);
-    return send(res, 200, { data: enrichBatch(db, batch) });
+    return send(res, result.status, result.error ? result : { data: result.data });
+  }
+
+  // ---- 保存位置与温湿度/光照阈值 -----------------------------------------
+
+  if (req.method === "GET" && pathname === "/locations") {
+    const db = await readDb();
+    return send(res, 200, { data: db.locations });
+  }
+
+  if (req.method === "POST" && pathname === "/locations") {
+    const body = await parseBody(req);
+    const location = await mutate((db) => storage.createLocation(db, body, makeId));
+    return send(res, 201, { data: location });
+  }
+
+  const locationMatch = pathname.match(/^\/locations\/([^/]+)$/);
+  if (locationMatch && req.method === "GET") {
+    const db = await readDb();
+    const location = storage.findLocation(db, locationMatch[1]);
+    return send(res, 200, { data: location });
+  }
+
+  if (locationMatch && req.method === "PATCH") {
+    const body = await parseBody(req);
+    const location = await mutate((db) => storage.updateLocation(db, locationMatch[1], body));
+    return send(res, 200, { data: location });
+  }
+
+  // ---- 保存时段 ----------------------------------------------------------
+
+  if (req.method === "GET" && pathname === "/storage-periods") {
+    const db = await readDb();
+    const data = storage
+      .listStoragePeriods(db, {
+        rubbingId: q("rubbingId"),
+        locationId: q("locationId"),
+        active: q("active")
+      })
+      .map((period) => storage.enrichStoragePeriod(db, period));
+    return send(res, 200, { data });
+  }
+
+  const rubbingPeriodsMatch = pathname.match(/^\/rubbings\/([^/]+)\/storage-periods$/);
+  if (rubbingPeriodsMatch && req.method === "GET") {
+    const rubbingId = rubbingPeriodsMatch[1];
+    const db = await readDb();
+    findRubbing(db, rubbingId);
+    const data = storage
+      .listStoragePeriods(db, { rubbingId })
+      .map((period) => storage.enrichStoragePeriod(db, period));
+    return send(res, 200, { data });
+  }
+
+  if (rubbingPeriodsMatch && req.method === "POST") {
+    const rubbingId = rubbingPeriodsMatch[1];
+    const body = await parseBody(req);
+    const period = await mutate((db) =>
+      storage.createStoragePeriod(db, { ...body, rubbingId }, makeId)
+    );
+    return send(res, 201, { data: period });
+  }
+
+  const periodCloseMatch = pathname.match(/^\/storage-periods\/([^/]+)\/close$/);
+  if (periodCloseMatch && req.method === "POST") {
+    const body = await parseBody(req);
+    const period = await mutate((db) => storage.closeStoragePeriod(db, periodCloseMatch[1], body));
+    return send(res, 200, { data: period });
+  }
+
+  // ---- 位置传感器读数 ----------------------------------------------------
+
+  const readingsMatch = pathname.match(/^\/locations\/([^/]+)\/readings$/);
+  if (readingsMatch && req.method === "POST") {
+    const body = await parseBody(req);
+    const result = await mutate((db) =>
+      storage.addReading(db, { ...body, locationId: readingsMatch[1] }, makeId)
+    );
+    return send(res, 201, {
+      data: result.reading,
+      anomalyEvent: result.anomalyEvent,
+      anomalyPeriod: result.anomalyPeriod
+    });
+  }
+
+  if (req.method === "GET" && pathname === "/readings") {
+    const db = await readDb();
+    const data = storage.listReadings(db, {
+      rubbingId: q("rubbingId"),
+      locationId: q("locationId"),
+      breached: q("breached"),
+      from: q("from") ?? undefined,
+      to: q("to") ?? undefined,
+      limit: q("limit") ?? undefined
+    });
+    return send(res, 200, { data });
+  }
+
+  // ---- 异常时段查询 ------------------------------------------------------
+
+  if (req.method === "GET" && pathname === "/anomalies") {
+    const db = await readDb();
+    const data = storage.listAnomalies(db, {
+      rubbingId: q("rubbingId"),
+      locationId: q("locationId"),
+      status: q("status")
+    });
+    return send(res, 200, { data });
   }
 
   return send(res, 404, { error: "接口不存在", routes });
 }
 
-const server = http.createServer((req, res) => {
-  handle(req, res).catch((error) => send(res, error.status || 500, { error: error.message || "服务器错误" }));
-});
+function createServer() {
+  return http.createServer((req, res) => {
+    handle(req, res).catch((error) =>
+      send(res, error.status || 500, { error: error.message || "服务器错误" })
+    );
+  });
+}
 
-server.listen(PORT, () => {
-  console.log(`Rubbing repair API running at http://127.0.0.1:${PORT}`);
-});
+module.exports = { createServer, routes, handle };
+
+if (require.main === module) {
+  const instance = createServer().listen(PORT, () => {
+    const address = instance.address();
+    const actualPort = address && typeof address === "object" ? address.port : PORT;
+    console.log(`Rubbing repair API running at http://127.0.0.1:${actualPort}`);
+  });
+}

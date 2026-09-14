@@ -1,0 +1,13 @@
+{
+  "name": "rubbing-repair-api",
+  "version": "1.1.0",
+  "description": "古籍拓片缺损修补与保存环境巡护 API（零依赖）",
+  "private": true,
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
