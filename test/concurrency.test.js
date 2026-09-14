@@ -106,6 +106,39 @@ test("并发写不同位置读数互不覆盖（无丢失更新）", async () =>
   assert.equal(totalListed, totalCreated, "总数一致，无丢失更新");
 });
 
+test("并发混合：非法日期/越量程/重复请求一律不写库，合法请求不丢失", async () => {
+  const loc = await h.createLocation();
+  const tasks = [
+    // 合法（不同时间戳）
+    h.post(`/locations/${loc.id}/readings`, { ts: "2026-11-01T08:00:00Z", temperature: 20 }),
+    h.post(`/locations/${loc.id}/readings`, { ts: "2026-11-01T08:05:00Z", temperature: 21 }),
+    // 非法公历日期：11 月没有 31 日，会滚到 12-01 —— 必须拒绝
+    h.post(`/locations/${loc.id}/readings`, { ts: "2026-11-31T08:10:00Z", temperature: 20 }),
+    // 非闰年 02-29
+    h.post(`/locations/${loc.id}/readings`, { ts: "2026-02-29T08:15:00Z", temperature: 20 }),
+    // 越量程
+    h.post(`/locations/${loc.id}/readings`, { ts: "2026-11-01T08:20:00Z", temperature: 999 }),
+    // 与第一条同时间戳的重复
+    h.post(`/locations/${loc.id}/readings`, { ts: "2026-11-01T08:00:00Z", temperature: 22 }),
+    // 合法
+    h.post(`/locations/${loc.id}/readings`, { ts: "2026-11-01T08:25:00Z", temperature: 19 })
+  ];
+  const results = await Promise.all(tasks);
+  const byStatus = (code) => results.filter((r) => r.status === code);
+  assert.equal(byStatus(201).length, 3);
+  assert.equal(byStatus(400).length, 3); // 2 非法日期 + 1 越量程
+  assert.equal(byStatus(409).length, 1); // 重复
+
+  // 恰好 3 条合法读数落库，时间戳无 12-01 幽灵数据
+  const list = (await h.get(`/readings?locationId=${loc.id}`)).body.data;
+  assert.deepEqual(
+    list.map((r) => r.ts),
+    ["2026-11-01T08:00:00.000Z", "2026-11-01T08:05:00.000Z", "2026-11-01T08:25:00.000Z"]
+  );
+  const ghost = await h.get(`/readings?locationId=${loc.id}&from=2026-12-01T00:00:00Z&to=2026-12-02T00:00:00Z`);
+  assert.deepEqual(ghost.body.data, []);
+});
+
 test("并发上报两条相邻时间戳读数：不会产生重复异常时段", async () => {
   const loc = await h.createLocation();
   // 两个并发请求分别提交 08:00 / 08:05 的越限读数。
